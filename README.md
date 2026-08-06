@@ -1,13 +1,14 @@
-# python-project-template
+# sash
 
-Python project where Nix manages the dependencies. The dev shell provides
+POSIX sh reader/parser with scope-set variable binding ("binding as sets of
+scopes", Flatt 2016). Nix manages the dependencies; the dev shell provides
 Python (with all project deps), `uv`, `black`, and `mypy`.
 
 ## Usage
 
 ```sh
 nix develop        # or `direnv allow` if you use direnv
-python -m myproject.main
+python -m sash.main script.sh
 black src
 mypy
 ```
@@ -16,7 +17,7 @@ Build and run the packaged application:
 
 ```sh
 nix build
-./result/bin/myproject
+./result/bin/sash script.sh
 ```
 
 ## VS Code / Pylance

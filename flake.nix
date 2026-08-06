@@ -3,23 +3,44 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+
+    # Claude Code hook: runs black + mypy on every Python file Claude writes.
+    # Follows our nixpkgs so its black/mypy match the ones in this devShell.
+    #
+    # Local checkout for now. A relative "path:../claude-python-fix" does not
+    # work here: this flake is a git flake, so relative path inputs resolve
+    # against the store copy of the tree and cannot escape the repo. Once the
+    # hook repo is pushed, replace this with:
+    #   url = "github:<owner>/claude-python-fix";
+    claude-python-fix = {
+      url = "path:/Users/jake/Documents/Programming/Python/claude-python-fix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs }:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      claude-python-fix,
+    }:
     let
-      systems = [ "aarch64-darwin" "x86_64-darwin" "x86_64-linux" "aarch64-linux" ];
+      systems = [
+        "aarch64-darwin"
+        "x86_64-darwin"
+        "x86_64-linux"
+        "aarch64-linux"
+      ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
 
       # Project dependencies live here, not in pyproject.toml.
       # Add packages from nixpkgs' python3Packages set.
-      projectDeps = ps: with ps; [
-        requests
-      ];
+      projectDeps = ps: [ ];
     in
     {
       packages = forAllSystems (pkgs: {
         default = pkgs.python3Packages.buildPythonApplication {
-          pname = "myproject";
+          pname = "sash";
           version = "0.1.0";
           pyproject = true;
           src = ./.;
@@ -28,9 +49,18 @@
         };
       });
 
-      devShells = forAllSystems (pkgs:
+      devShells = forAllSystems (
+        pkgs:
         let
-          pythonEnv = pkgs.python3.withPackages projectDeps;
+          pythonEnv = pkgs.python3.withPackages (ps: projectDeps ps ++ [ ps.pytest ]);
+
+          # Shared by the hook binary below and by the settings.local.json the
+          # shellHook writes, so both always refer to the same build.
+          hookArgs = {
+            inherit pkgs pythonEnv;
+            targetVersion = "py312";
+            projectScope = "src";
+          };
         in
         {
           default = pkgs.mkShell {
@@ -40,6 +70,12 @@
               pkgs.black
               pkgs.mypy
               pkgs.jq # used by the shellHook below
+
+              # Not needed on PATH — Claude invokes it by absolute store path —
+              # but listing it makes the hook a dependency of this shell, so
+              # nix-collect-garbage cannot delete the path settings.local.json
+              # points at.
+              (claude-python-fix.lib.mkHook hookArgs)
             ];
 
             env = {
@@ -82,8 +118,15 @@
                 printf '%s\n' "$merged" > "$vscodeSettings"
                 echo "updated $vscodeSettings -> ${pythonEnv}"
               fi
+
+              # Register the black + mypy hook with Claude Code. Same reasoning
+              # as the block above: the hook's store path is machine-local and
+              # moves with its inputs, so .claude/settings.local.json is
+              # regenerated here rather than committed.
+              ${claude-python-fix.lib.settingsHook hookArgs}
             '';
           };
-        });
+        }
+      );
     };
 }
