@@ -41,6 +41,7 @@ class ScopeKind(enum.Enum):
     FUNCTION = "function"
     SUBSHELL = "subshell"
     COMMAND_SUB = "command-sub"
+    PROC_SUB = "proc-sub"
 
 
 class BindingKind(enum.Enum):
@@ -54,6 +55,7 @@ class BindingKind(enum.Enum):
     LOCAL = "local"
     EXPORT = "export"
     READONLY = "readonly"
+    NAMEREF = "nameref"
 
 
 SiteKind = Literal["binder", "unset", "implicit"]
@@ -69,6 +71,9 @@ class Site:
 class Binding:
     kind: BindingKind
     sites: list[Site] = field(default_factory=list)
+    # For NAMEREF bindings whose initializer is a single unquoted literal
+    # name: a minted, painted reference to the target variable.
+    nameref_target: ShId | None = None
 
 
 @dataclass(eq=False)  # identity hash: scopes are object identities

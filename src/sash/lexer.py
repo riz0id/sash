@@ -13,13 +13,17 @@ HereDoc placeholder is shared with the parser via `heredoc_for`.
 
 from __future__ import annotations
 
+import re
 from typing import Literal, cast
 
 from .nodes import (
+    AnsiCQuote,
     Arith,
-    ArithPart,
+    ArithExpr,
+    BraceExpand,
     CmdSub,
     CmdSubStyle,
+    Dialect,
     DQuote,
     DQuotePart,
     Escape,
@@ -28,6 +32,7 @@ from .nodes import (
     Lit,
     Loc,
     Param,
+    ProcSub,
     ShId,
     ShParseError,
     SQuote,
@@ -62,7 +67,35 @@ OPERATORS = [
     ")",
 ]
 
+BASH_OPERATORS = [
+    "<<<",
+    "<<-",
+    "&>>",
+    "<<",
+    "<&",
+    "<>",
+    ">>",
+    ">&",
+    ">|",
+    "&>",
+    "&&",
+    "||",
+    ";;&",
+    ";;",
+    ";&",
+    "<",
+    ">",
+    "&",
+    "|",
+    ";",
+    "(",
+    ")",
+]
+
 WORD_DELIMS = " \t\n|&;<>()"
+# Inside [[ ]], a regex word keeps unquoted parens (and their contents);
+# only unparenthesized metacharacters and blanks terminate it.
+COND_REGEX_STOP = " \t\n|&;<>"
 SPECIAL_PARAM_CHARS = "@*#?-$!"
 _NAME_START = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_"
 _NAME_CHARS = _NAME_START + "0123456789"
@@ -81,6 +114,7 @@ class Lexer:
         line: int = 1,
         col: int = 0,
         synthetic: bool = False,
+        dialect: Dialect = Dialect.POSIX,
     ) -> None:
         self.text = text
         self.src = src
@@ -88,9 +122,13 @@ class Lexer:
         self.line = line
         self.col = col
         self.synthetic = synthetic
+        self.dialect = dialect
         self._await_delim: ShId | None = None
         self._pending_heredocs: list[tuple[HereDoc, str]] = []
         self._heredoc_by_word: dict[int, HereDoc] = {}
+        # bash lexes `a[foo bar]=x` as one word only where an assignment is
+        # grammatically acceptable: at command position or after one
+        self._assign_ok = True
 
     # -- position bookkeeping ------------------------------------------------
 
@@ -135,6 +173,12 @@ class Lexer:
             self._await_delim = tok.id
         else:
             self._await_delim = None
+        if isinstance(tok, (TokOp, TokNewline)):
+            self._assign_ok = True
+        elif isinstance(tok, TokWord):
+            self._assign_ok = _is_assignment_shaped(tok.word)
+        else:
+            self._assign_ok = False
         return tok
 
     def _skip_blanks(self) -> None:
@@ -170,11 +214,19 @@ class Lexer:
                 n = int(self.text[self.pos : j])
                 self._adv(j - self.pos)
                 return TokIoNumber(n, self._loc(mark))
-        for op in OPERATORS:
+        if self.dialect is Dialect.BASH and ch in "<>" and self._peek(1) == "(":
+            word = self._lex_procsub_word()
+            return TokWord(word, word.loc)
+        ops = BASH_OPERATORS if self.dialect is Dialect.BASH else OPERATORS
+        for op in ops:
             if self.text.startswith(op, self.pos):
                 self._adv(len(op))
                 loc = self._loc(mark)
                 return TokOp(ShId(op, IdKind.OPERATOR, loc), loc)
+        if self.dialect is Dialect.BASH and self._assign_ok and ch in _NAME_START:
+            assign_word = self._try_lex_assignment_word()
+            if assign_word is not None:
+                return TokWord(assign_word, assign_word.loc)
         word = self._lex_word()
         return TokWord(word, word.loc)
 
@@ -182,15 +234,105 @@ class Lexer:
 
     def _lex_word(self) -> Word:
         mark = self._mark()
-        parts = self._lex_parts(stop=WORD_DELIMS, mode="word")
+        parts = self._lex_parts(stop=WORD_DELIMS, mode="word", brace=True)
         if not parts:
             raise self._error(f"unexpected character {self._peek()!r}")
         return Word(parts, self._loc(mark))
 
-    def _lex_parts(self, *, stop: str, mode: Mode) -> list[WordPart]:
+    # -- bash [[ ]] conditional tokens ---------------------------------------
+    #
+    # Inside [[ ]] words lex with the ordinary quoting/expansion rules, but
+    # '<' '>' '&&' '||' '(' ')' are operators (no redirects here), newlines
+    # are blanks, and ']]' terminates (recognized as a word by the parser).
+
+    def next_cond_token(self) -> Token:
+        return self._scan_cond_token(regex=False)
+
+    def next_cond_regex_token(self) -> Token:
+        return self._scan_cond_token(regex=True)
+
+    def _scan_cond_token(self, *, regex: bool) -> Token:
+        while True:
+            self._skip_blanks()
+            ch = self._peek()
+            if ch == "\n":
+                self._adv()
+                self._collect_heredocs()
+                continue
+            if ch == "#":
+                while self._peek() not in ("", "\n"):
+                    self._adv()
+                continue
+            break
+        mark = self._mark()
+        ch = self._peek()
+        if ch == "":
+            return TokEof(self._loc(mark))
+        if not regex:
+            for op in ("&&", "||", "(", ")", "<", ">"):
+                if self.text.startswith(op, self.pos):
+                    self._adv(len(op))
+                    loc = self._loc(mark)
+                    return TokOp(ShId(op, IdKind.OPERATOR, loc), loc)
+            parts = self._lex_parts(stop=WORD_DELIMS, mode="word")
+        else:
+            parts = self._lex_parts(stop=COND_REGEX_STOP, mode="word", cond_regex=True)
+        if not parts:
+            raise self._error(
+                f"unexpected character {ch!r} in conditional expression", mark
+            )
+        word = Word(parts, self._loc(mark))
+        return TokWord(word, word.loc)
+
+    def _try_lex_assignment_word(self) -> Word | None:
+        """A word with a `name[...]=` / `name[...]+=` prefix (bash arrays).
+
+        The subscript runs to the matching `]` and may contain almost
+        anything, including blanks, so ordinary word splitting must not
+        apply inside it.
+        """
+        j = self.pos
+        while j < len(self.text) and self.text[j] in _NAME_CHARS:
+            j += 1
+        if not self.text.startswith("[", j):
+            return None
+        depth = 0
+        k = j
+        while k < len(self.text):
+            c = self.text[k]
+            if c == "\n":
+                return None
+            if c == "[":
+                depth += 1
+            elif c == "]":
+                depth -= 1
+                if depth == 0:
+                    break
+            k += 1
+        else:
+            return None
+        end = k + 1
+        if self.text.startswith("+=", end):
+            end += 2
+        elif self.text.startswith("=", end):
+            end += 1
+        else:
+            return None
+        mark = self._mark()
+        self._adv(end - self.pos)
+        parts: list[WordPart] = [Lit(self.text[mark[0] : self.pos], self._loc(mark))]
+        parts.extend(self._lex_parts(stop=WORD_DELIMS, mode="word", brace=True))
+        return Word(parts, self._loc(mark))
+
+    def _lex_parts(
+        self, *, stop: str, mode: Mode, brace: bool = False, cond_regex: bool = False
+    ) -> list[WordPart]:
         parts: list[WordPart] = []
         lit_mark: _Mark | None = None
         lit_chars: list[str] = []
+        # bash keeps unquoted parens (and everything inside them) as part of
+        # a =~ regex word, so stop characters are inert while depth > 0
+        depth = 0
 
         def flush() -> None:
             nonlocal lit_mark
@@ -209,7 +351,19 @@ class Lexer:
 
         while True:
             ch = self._peek()
-            if ch == "" or (stop and ch in stop and mode != "heredoc"):
+            if ch == "":
+                break
+            if cond_regex and ch == "(":
+                depth += 1
+                lit(ch, 1)
+                continue
+            if cond_regex and ch == ")":
+                if depth == 0:
+                    break
+                depth -= 1
+                lit(ch, 1)
+                continue
+            if stop and ch in stop and mode != "heredoc" and depth == 0:
                 break
             if ch == "\\":
                 nxt = self._peek(1)
@@ -251,6 +405,14 @@ class Lexer:
                 flush()
                 parts.append(self._lex_backtick())
                 continue
+            if ch == "{" and brace and self.dialect is Dialect.BASH:
+                expand = self._try_brace_expand()
+                if expand is not None:
+                    flush()
+                    parts.append(expand)
+                    continue
+                lit("{", 1)
+                continue
             lit(ch, 1)
         flush()
         return parts
@@ -276,12 +438,67 @@ class Lexer:
         self._adv()  # "
         return DQuote(cast("list[DQuotePart]", parts), self._loc(mark))
 
+    # -- bash quoting and brace expansion ------------------------------------
+
+    def _lex_ansi_c(self, mark: _Mark) -> AnsiCQuote:
+        self._adv()  # '
+        start = self.pos
+        while True:
+            ch = self._peek()
+            if ch == "":
+                raise self._error("unterminated $'...'", mark)
+            if ch == "\\" and self._peek(1) != "":
+                self._adv(2)
+                continue
+            if ch == "'":
+                break
+            self._adv()
+        raw = self.text[start : self.pos]
+        self._adv()  # '
+        return AnsiCQuote(_decode_ansi_c(raw), raw, self._loc(mark))
+
+    def _try_brace_expand(self) -> BraceExpand | None:
+        entry = self._mark()
+        self._adv()  # {
+        m = _BRACE_RANGE_RE.match(self.text, self.pos)
+        if m is not None and _range_endpoints_compatible(m.group(1), m.group(2)):
+            self._adv(m.end() - self.pos)
+            return BraceExpand(
+                None, (m.group(1), m.group(2), m.group(3)), self._loc(entry)
+            )
+        alternates: list[list[WordPart]] = []
+        saw_comma = False
+        while True:
+            parts = self._lex_parts(stop=",}" + WORD_DELIMS, mode="word", brace=True)
+            ch = self._peek()
+            if ch == ",":
+                alternates.append(parts)
+                saw_comma = True
+                self._adv()
+                continue
+            if ch == "}" and saw_comma:
+                alternates.append(parts)
+                self._adv()
+                return BraceExpand(alternates, None, self._loc(entry))
+            self._restore(entry)
+            return None
+
     # -- $... ----------------------------------------------------------------
 
     def _lex_dollar(self, mode: Mode) -> WordPart:
         mark = self._mark()
         self._adv()  # $
         ch = self._peek()
+        if self.dialect is Dialect.BASH and mode == "word":
+            if ch == "'":
+                return self._lex_ansi_c(mark)
+            if ch == '"':
+                dq = self._lex_dquote()
+                dq.locale = True
+                dq.loc = self._loc(mark)
+                return dq
+            if ch == "[":
+                return self._lex_deprecated_arith(mark)
         if ch == "(":
             if self._peek(1) == "(":
                 arith = self._try_arith(mark)
@@ -290,7 +507,7 @@ class Lexer:
             return self._lex_dollar_cmdsub(mark)
         if ch == "{":
             return self._lex_braced_param(mark, mode)
-        if ch in _NAME_START:
+        if ch != "" and ch in _NAME_START:
             start = self.pos
             while self._peek() in _NAME_CHARS and self._peek() != "":
                 self._adv()
@@ -302,7 +519,7 @@ class Lexer:
             loc = self._loc(mark)
             kind = IdKind.SPECIAL_PARAM if ch == "0" else IdKind.POSITIONAL
             return Param(ShId(ch, kind, loc), None, None, False, loc)
-        if ch in SPECIAL_PARAM_CHARS:
+        if ch != "" and ch in SPECIAL_PARAM_CHARS:
             self._adv()
             loc = self._loc(mark)
             return Param(ShId(ch, IdKind.SPECIAL_PARAM, loc), None, None, False, loc)
@@ -335,21 +552,61 @@ class Lexer:
             self._adv()
             name_mark = self._mark()
             named = self._read_param_name()
-            if named is None or self._peek() != "}":
+            if named is None:
+                raise self._error("bad substitution", mark)
+            name, kind = named
+            subscript, subscript_raw = self._maybe_param_subscript(kind, mark)
+            if self._peek() != "}":
                 raise self._error("bad substitution", mark)
             self._adv()  # }
-            name, kind = named
             loc = self._loc(mark)
-            return Param(ShId(name, kind, self._loc(name_mark)), None, None, True, loc)
+            return Param(
+                ShId(name, kind, self._loc(name_mark)),
+                None,
+                None,
+                True,
+                loc,
+                subscript=subscript,
+                subscript_raw=subscript_raw,
+            )
+        indirect = False
+        if (
+            self.dialect is Dialect.BASH
+            and self._peek() == "!"
+            and self._peek(1) != ""
+            and self._peek(1) in _NAME_START
+        ):
+            self._adv()  # !
+            indirect = True
         name_mark = self._mark()
         named = self._read_param_name()
         if named is None:
             raise self._error("bad substitution", mark)
         name, kind = named
         name_id = ShId(name, kind, self._loc(name_mark))
+        if indirect and self._peek() in ("*", "@") and self._peek(1) == "}":
+            listing = self._peek()
+            self._adv(2)  # * or @, then }
+            return Param(name_id, "!" + listing, None, False, self._loc(mark))
+        subscript, subscript_raw = self._maybe_param_subscript(kind, mark)
         if self._peek() == "}":
             self._adv()
-            return Param(name_id, None, None, False, self._loc(mark))
+            return Param(
+                name_id,
+                None,
+                None,
+                False,
+                self._loc(mark),
+                indirect=indirect,
+                subscript=subscript,
+                subscript_raw=subscript_raw,
+            )
+        if self.dialect is Dialect.BASH:
+            ext = self._lex_bash_param_ext(
+                mark, mode, name_id, indirect, subscript, subscript_raw
+            )
+            if ext is not None:
+                return ext
         op = self._read_param_op()
         if op is None:
             raise self._error("bad substitution", mark)
@@ -357,7 +614,174 @@ class Lexer:
         if self._peek() != "}":
             raise self._error("unterminated ${...}", mark)
         self._adv()  # }
-        return Param(name_id, op, word, False, self._loc(mark))
+        return Param(
+            name_id,
+            op,
+            word,
+            False,
+            self._loc(mark),
+            indirect=indirect,
+            subscript=subscript,
+            subscript_raw=subscript_raw,
+        )
+
+    def _maybe_param_subscript(
+        self, kind: IdKind, mark: _Mark
+    ) -> tuple[ArithExpr | Lit | None, str | None]:
+        if (
+            self.dialect is not Dialect.BASH
+            or kind is not IdKind.VARIABLE_REF
+            or self._peek() != "["
+        ):
+            return None, None
+        self._adv()  # [
+        sub_mark = self._mark()
+        if self._peek() in ("@", "*") and self._peek(1) == "]":
+            ch = self._peek()
+            self._adv()
+            lit = Lit(ch, self._loc(sub_mark))
+            self._adv()  # ]
+            return lit, ch
+        depth = 0
+        while True:
+            ch = self._peek()
+            if ch == "":
+                raise self._error("unterminated ${...}", mark)
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                if depth == 0:
+                    break
+                depth -= 1
+            self._adv()
+        raw = self.text[sub_mark[0] : self.pos]
+        loc = self._loc(sub_mark)
+        self._adv()  # ]
+        from .arith import parse_arith
+
+        try:
+            return parse_arith(raw, loc, dialect=self.dialect), raw
+        except ShParseError:
+            # not arithmetic; keep the raw text (associative-array key)
+            return None, raw
+
+    def _lex_bash_param_ext(
+        self,
+        mark: _Mark,
+        mode: Mode,
+        name_id: ShId,
+        indirect: bool,
+        subscript: ArithExpr | Lit | None,
+        subscript_raw: str | None,
+    ) -> Param | None:
+        word_mode: Mode = mode if mode == "dquote" else "word"
+        ch = self._peek()
+        if ch == "/":
+            if self._peek(1) == "/":
+                op = "//"
+                self._adv(2)
+            elif self._peek(1) in ("#", "%"):
+                op = "/" + self._peek(1)
+                self._adv(2)
+            else:
+                op = "/"
+                self._adv()
+            pattern = self._lex_parts(stop="/}", mode=word_mode)
+            word: list[WordPart] | None = None
+            if self._peek() == "/":
+                self._adv()
+                word = self._lex_parts(stop="}", mode=word_mode)
+            if self._peek() != "}":
+                raise self._error("unterminated ${...}", mark)
+            self._adv()  # }
+            return Param(
+                name_id,
+                op,
+                word,
+                False,
+                self._loc(mark),
+                pattern=pattern,
+                indirect=indirect,
+                subscript=subscript,
+                subscript_raw=subscript_raw,
+            )
+        if ch == ":" and not (self._peek(1) != "" and self._peek(1) in "-=?+"):
+            self._adv()
+            offset = self._scan_arith_until(":}", mark)
+            length: ArithExpr | None = None
+            if self._peek() == ":":
+                self._adv()
+                length = self._scan_arith_until("}", mark)
+            if self._peek() != "}":
+                raise self._error("unterminated ${...}", mark)
+            self._adv()  # }
+            return Param(
+                name_id,
+                ":",
+                None,
+                False,
+                self._loc(mark),
+                offset=offset,
+                length=length,
+                indirect=indirect,
+                subscript=subscript,
+                subscript_raw=subscript_raw,
+            )
+        if ch in ("^", ","):
+            op = ch * 2 if self._peek(1) == ch else ch
+            self._adv(len(op))
+            word = self._lex_parts(stop="}", mode=word_mode)
+            if self._peek() != "}":
+                raise self._error("unterminated ${...}", mark)
+            self._adv()  # }
+            return Param(
+                name_id,
+                op,
+                word,
+                False,
+                self._loc(mark),
+                indirect=indirect,
+                subscript=subscript,
+                subscript_raw=subscript_raw,
+            )
+        if ch == "@":
+            transform = self._peek(1)
+            if transform == "" or transform not in "QEPAKauLU":
+                raise self._error("bad substitution", mark)
+            self._adv(2)
+            if self._peek() != "}":
+                raise self._error("bad substitution", mark)
+            self._adv()  # }
+            return Param(
+                name_id,
+                "@" + transform,
+                None,
+                False,
+                self._loc(mark),
+                indirect=indirect,
+                subscript=subscript,
+                subscript_raw=subscript_raw,
+            )
+        return None
+
+    def _scan_arith_until(self, stops: str, mark: _Mark) -> ArithExpr:
+        from .arith import parse_arith
+
+        start = self._mark()
+        depth = 0
+        while True:
+            ch = self._peek()
+            if ch == "":
+                raise self._error("unterminated ${...}", mark)
+            if ch == "(":
+                depth += 1
+            elif ch == ")" and depth > 0:
+                depth -= 1
+            elif depth == 0 and ch in stops:
+                break
+            self._adv()
+        text = self.text[start[0] : self.pos]
+        return parse_arith(text, self._loc(start), dialect=self.dialect)
 
     def _read_param_op(self) -> str | None:
         ch = self._peek()
@@ -420,13 +844,39 @@ class Lexer:
                     self._adv()
                     continue
                 if self._peek(1) == ")":
+                    from .arith import parse_arith
+
                     content = self.text[content_mark[0] : self.pos]
-                    parts = _lex_arith_text(content, self._loc(content_mark))
+                    expr = parse_arith(
+                        content, self._loc(content_mark), dialect=self.dialect
+                    )
                     self._adv(2)  # ))
-                    return Arith(parts, self._loc(mark))
+                    return Arith(expr, self._loc(mark))
                 self._restore(entry)
                 return None
             self._adv()
+
+    def _lex_deprecated_arith(self, mark: _Mark) -> Arith:
+        from .arith import parse_arith
+
+        self._adv()  # [
+        content_mark = self._mark()
+        depth = 0
+        while True:
+            ch = self._peek()
+            if ch == "":
+                raise self._error("unterminated $[...]", mark)
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                if depth == 0:
+                    break
+                depth -= 1
+            self._adv()
+        content = self.text[content_mark[0] : self.pos]
+        expr = parse_arith(content, self._loc(content_mark), dialect=self.dialect)
+        self._adv()  # ]
+        return Arith(expr, self._loc(mark), deprecated=True)
 
     # -- $(...) and `...` ----------------------------------------------------
 
@@ -438,6 +888,18 @@ class Lexer:
         pos, line, col = content_mark
         raw_loc = Loc(self.src, line, col, pos, len(raw), self.synthetic)
         return CmdSub(raw, CmdSubStyle.DOLLAR, self._loc(mark), raw_loc)
+
+    def _lex_procsub_word(self) -> Word:
+        """A word beginning with bash process substitution `<(...)` / `>(...)`."""
+        mark = self._mark()
+        direction = self._peek()
+        self._adv(2)  # < or >, then (
+        content_mark = self._mark()
+        self._scan_dollar_paren(mark, what="process substitution")
+        raw = self.text[content_mark[0] : self.pos - 1]
+        parts: list[WordPart] = [ProcSub(direction, raw, self._loc(mark))]
+        parts.extend(self._lex_parts(stop=WORD_DELIMS, mode="word", brace=True))
+        return Word(parts, self._loc(mark))
 
     def _lex_backtick(self) -> CmdSub:
         mark = self._mark()
@@ -472,7 +934,9 @@ class Lexer:
     # not be fooled by `)` inside quotes, comments, here-doc bodies, nested
     # substitutions, or the unbalanced `)` closing a `case` pattern.
 
-    def _scan_dollar_paren(self, outer_mark: _Mark) -> None:
+    def _scan_dollar_paren(
+        self, outer_mark: _Mark, what: str = "command substitution"
+    ) -> None:
         expecting_in = 0  # `case` words seen, awaiting their `in`
         case_depth = 0  # open case bodies at this nesting level
         cmd_pos = True
@@ -509,7 +973,7 @@ class Lexer:
                 while True:
                     if self._peek() == "":
                         raise self._error(
-                            "unterminated here-document in command substitution",
+                            f"unterminated here-document in {what}",
                             outer_mark,
                         )
                     start = self.pos
@@ -524,7 +988,7 @@ class Lexer:
         while True:
             ch = self._peek()
             if ch == "":
-                raise self._error("unterminated command substitution", outer_mark)
+                raise self._error(f"unterminated {what}", outer_mark)
             if ch == "\\":
                 self._adv(2 if self._peek(1) != "" else 1)
                 word += "\\"
@@ -571,6 +1035,17 @@ class Lexer:
                     continue
                 self._adv()
                 return
+            if (
+                self.dialect is Dialect.BASH
+                and ch == "<"
+                and self._peek(1) == "<"
+                and self._peek(2) == "<"
+            ):
+                # here-string, not a here-document: no body to skip
+                flush()
+                self._adv(3)
+                cmd_pos = False
+                continue
             if ch == "<" and self._peek(1) == "<" and self._peek(2) != "&":
                 flush()
                 self._adv(2)
@@ -706,8 +1181,110 @@ class Lexer:
                 loc = Loc(self.src, line, col, body_mark[0], len(body_text), True)
                 hd.body = [Lit(body_text, loc)] if body_text else []
             else:
-                sub = Lexer(body_text, self.src, line=line, synthetic=True)
+                sub = Lexer(
+                    body_text,
+                    self.src,
+                    line=line,
+                    synthetic=True,
+                    dialect=self.dialect,
+                )
                 hd.body = sub._lex_parts(stop="", mode="heredoc")
+
+
+_BRACE_RANGE_RE = re.compile(
+    r"([+-]?\d+|[A-Za-z])\.\.([+-]?\d+|[A-Za-z])(?:\.\.([+-]?\d+))?\}"
+)
+
+_ASSIGN_SHAPE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\[.*\])?\+?=")
+
+
+def _is_assignment_shaped(word: Word) -> bool:
+    if not word.parts or not isinstance(word.parts[0], Lit):
+        return False
+    return _ASSIGN_SHAPE_RE.match(word.parts[0].text) is not None
+
+
+_HEX_DIGITS = "0123456789abcdefABCDEF"
+
+_ANSI_SIMPLE = {
+    "a": "\a",
+    "b": "\b",
+    "e": "\x1b",
+    "E": "\x1b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "v": "\v",
+    "\\": "\\",
+    "'": "'",
+    '"': '"',
+    "?": "?",
+}
+
+
+def _range_endpoints_compatible(start: str, end: str) -> bool:
+    return start.lstrip("+-").isdigit() == end.lstrip("+-").isdigit()
+
+
+def _decode_ansi_c(raw: str) -> str:
+    out: list[str] = []
+    i = 0
+    n = len(raw)
+    while i < n:
+        ch = raw[i]
+        if ch != "\\" or i + 1 == n:
+            out.append(ch)
+            i += 1
+            continue
+        c = raw[i + 1]
+        if c in _ANSI_SIMPLE:
+            out.append(_ANSI_SIMPLE[c])
+            i += 2
+            continue
+        if c in "01234567":
+            j = i + 1
+            while j < n and j < i + 4 and raw[j] in "01234567":
+                j += 1
+            out.append(chr(int(raw[i + 1 : j], 8) & 0xFF))
+            i = j
+            continue
+        if c == "x":
+            j = i + 2
+            while j < n and j < i + 4 and raw[j] in _HEX_DIGITS:
+                j += 1
+            if j == i + 2:
+                out.append("\\x")
+            else:
+                out.append(chr(int(raw[i + 2 : j], 16)))
+            i = max(j, i + 2)
+            continue
+        if c in "uU":
+            width = 4 if c == "u" else 8
+            j = i + 2
+            while j < n and j < i + 2 + width and raw[j] in _HEX_DIGITS:
+                j += 1
+            if j == i + 2:
+                out.append("\\" + c)
+            else:
+                out.append(chr(int(raw[i + 2 : j], 16)))
+            i = max(j, i + 2)
+            continue
+        if c == "c":
+            if i + 2 >= n:
+                out.append("\\c")
+                i += 2
+                continue
+            target = raw[i + 2]
+            consumed = 3
+            if target == "\\" and i + 3 < n and raw[i + 3] == "\\":
+                consumed = 4  # backslash after \c must itself be escaped
+            out.append(chr(ord(target.upper()) & 0x1F))
+            i += consumed
+            continue
+        out.append("\\" + c)
+        i += 2
+    return "".join(out)
 
 
 def _delimiter_text(word: Word) -> str:
@@ -732,57 +1309,3 @@ def _delimiter_text(word: Word) -> str:
                 "here-document delimiter must be a literal word", word.loc
             )
     return "".join(chars)
-
-
-def _lex_arith_text(text: str, base: Loc) -> list[ArithPart]:
-    """Extract variable references from $((...)) content.
-
-    `$x`, `${x}`, `$(...)` and backticks are lexed for real; bare NAMEs
-    surface as VARIABLE_REF identifiers (POSIX arithmetic treats them as
-    variables); everything else remains literal text. No expression AST.
-    """
-    sub = Lexer(text, base.src, line=base.line, col=base.col, synthetic=base.synthetic)
-    parts: list[ArithPart] = []
-    lit_mark: _Mark | None = None
-    lit_chars: list[str] = []
-
-    def flush() -> None:
-        nonlocal lit_mark
-        if lit_chars:
-            assert lit_mark is not None
-            parts.append(Lit("".join(lit_chars), sub._loc(lit_mark)))
-            lit_chars.clear()
-        lit_mark = None
-
-    while True:
-        ch = sub._peek()
-        if ch == "":
-            break
-        if ch == "$":
-            flush()
-            dollar = sub._lex_dollar("word")
-            if isinstance(dollar, (Lit, Param, CmdSub, Arith)):
-                if isinstance(dollar, Arith):
-                    parts.extend(dollar.parts)
-                else:
-                    parts.append(dollar)
-            continue
-        if ch == "`":
-            flush()
-            parts.append(sub._lex_backtick())
-            continue
-        if ch in _NAME_START:
-            flush()
-            mark = sub._mark()
-            start = sub.pos
-            while sub._peek() in _NAME_CHARS and sub._peek() != "":
-                sub._adv()
-            name = sub.text[start : sub.pos]
-            parts.append(ShId(name, IdKind.VARIABLE_REF, sub._loc(mark)))
-            continue
-        if lit_mark is None:
-            lit_mark = sub._mark()
-        lit_chars.append(ch)
-        sub._adv()
-    flush()
-    return parts

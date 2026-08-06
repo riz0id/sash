@@ -12,18 +12,42 @@ from .bind import sh_bind
 from .lexer import Lexer
 from .nodes import (
     AndOr,
+    AnsiCQuote,
     Arith,
+    ArithAssign,
+    ArithBinary,
+    ArithCommand,
+    ArithExpr,
+    ArithGroup,
+    ArithNum,
+    ArithPart,
+    ArithTernary,
+    ArithUnary,
+    ArithVar,
+    ArrayItem,
     Assign,
     Async,
+    BraceExpand,
     BraceGroup,
     Case,
     CaseItem,
     CmdSub,
     CmdSubStyle,
     Command,
+    CondAnd,
+    CondBinary,
+    CondCmd,
+    CondExpr,
+    CondGroup,
+    CondNot,
+    CondOr,
+    CondUnary,
+    Coproc,
+    Dialect,
     DQuote,
     Escape,
     For,
+    ForArith,
     FunDef,
     HereDoc,
     IdKind,
@@ -32,8 +56,10 @@ from .nodes import (
     Loc,
     Param,
     Pipeline,
+    ProcSub,
     Program,
     Redirect,
+    Select,
     ShId,
     ShParseError,
     Simple,
@@ -64,21 +90,45 @@ from .scopes import (
 
 __all__ = [
     "AndOr",
+    "AnsiCQuote",
     "Arith",
+    "ArithAssign",
+    "ArithBinary",
+    "ArithCommand",
+    "ArithExpr",
+    "ArithGroup",
+    "ArithNum",
+    "ArithPart",
+    "ArithTernary",
+    "ArithUnary",
+    "ArithVar",
+    "ArrayItem",
     "Assign",
     "Async",
     "Binding",
     "BindingKind",
     "BindingStore",
+    "BraceExpand",
     "BraceGroup",
     "Case",
     "CaseItem",
     "CmdSub",
     "CmdSubStyle",
     "Command",
+    "CondAnd",
+    "CondBinary",
+    "CondCmd",
+    "CondExpr",
+    "CondGroup",
+    "CondNot",
+    "CondOr",
+    "CondUnary",
+    "Coproc",
     "DQuote",
+    "Dialect",
     "Escape",
     "For",
+    "ForArith",
     "FunDef",
     "HereDoc",
     "IdKind",
@@ -88,10 +138,12 @@ __all__ = [
     "Namespace",
     "Param",
     "Pipeline",
+    "ProcSub",
     "Program",
     "Redirect",
     "Scope",
     "ScopeKind",
+    "Select",
     "ShAmbiguityError",
     "ShId",
     "ShParseError",
@@ -120,8 +172,10 @@ __all__ = [
 ]
 
 
-def sh_read(text: str, src: str = "<sh>") -> Program:
-    return parse(text, src)
+def sh_read(
+    text: str, src: str = "<sh>", *, dialect: Dialect = Dialect.POSIX
+) -> Program:
+    return parse(text, src, dialect=dialect)
 
 
 def sh_lex(text: str, src: str = "<sh>") -> list[Token]:
@@ -135,10 +189,14 @@ def sh_lex(text: str, src: str = "<sh>") -> list[Token]:
 
 
 def sh_read_program(
-    text: str, src: str = "<sh>", *, recognize_local: bool = False
+    text: str,
+    src: str = "<sh>",
+    *,
+    dialect: Dialect = Dialect.POSIX,
+    recognize_local: bool = False,
 ) -> tuple[Program, BindingStore]:
-    program = parse(text, src)
-    store = sh_bind(program, recognize_local=recognize_local)
+    program = parse(text, src, dialect=dialect)
+    store = sh_bind(program, dialect=dialect, recognize_local=recognize_local)
     return program, store
 
 
@@ -165,11 +223,20 @@ def identifier_binding(
 
     Returns (binding-kind, sym, sorted scope names, site locations) or None
     when unbound. Implicit/unset sites appear as the strings "implicit" and
-    "unset".
+    "unset". A NAMEREF binding with a statically known target (`declare -n
+    ref=target`) is followed one step: the target cell's kind, name, and
+    sites are reported. Dynamic nameref targets report the NAMEREF itself.
     """
     binding = resolve_identifier(sh_id, ns, ambiguous_ok=True)
     if binding is None:
         return None
+    sym = sh_id.sym
+    if binding.kind is BindingKind.NAMEREF and binding.nameref_target is not None:
+        target = binding.nameref_target
+        target_binding = resolve(target, Namespace.VARIABLE, ambiguous_ok=True)
+        if target_binding is not None:
+            binding = target_binding
+            sym = target.sym
     scope_names = sorted(sc.name for sc in sh_id.scopes)
     sites: list[Loc | str] = []
     for site in binding.sites:
@@ -177,4 +244,4 @@ def identifier_binding(
             sites.append(site.kind)
         else:
             sites.append(site.id.loc)
-    return (binding.kind.value, sh_id.sym, scope_names, sites)
+    return (binding.kind.value, sym, scope_names, sites)

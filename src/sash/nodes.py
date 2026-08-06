@@ -35,6 +35,11 @@ class ShParseError(Exception):
         self.loc = loc
 
 
+class Dialect(enum.Enum):
+    POSIX = "posix"
+    BASH = "bash"
+
+
 class IdKind(enum.Enum):
     COMMAND = "command"
     OPERATOR = "operator"
@@ -82,15 +87,33 @@ class SQuote:
 class DQuote:
     parts: list[DQuotePart]
     loc: Loc
+    locale: bool = False  # bash $"..."
+
+
+@dataclass(eq=False)
+class AnsiCQuote:
+    text: str  # decoded value
+    raw: str  # source text between the quotes
+    loc: Loc
 
 
 @dataclass(eq=False)
 class Param:
     id: ShId
-    op: str | None  # ':-', '-', ':=', '=', ':?', '?', ':+', '+', '%', '%%', '#', '##'
+    # POSIX: ':-', '-', ':=', '=', ':?', '?', ':+', '+', '%', '%%', '#', '##'
+    # bash: '/', '//', '/#', '/%', ':', '^', '^^', ',', ',,', '@X', '!*', '!@'
+    op: str | None
     word: list[WordPart] | None
     is_length: bool
     loc: Loc
+    pattern: list[WordPart] | None = None  # bash replace ops: text before '/'
+    offset: ArithExpr | None = None  # bash ${x:off}
+    length: ArithExpr | None = None  # bash ${x:off:len}
+    indirect: bool = False  # bash ${!x}
+    # bash ${a[i]}: '@' and '*' stored as Lit; None with a non-None
+    # subscript_raw when the raw text is not arithmetic (assoc-style key)
+    subscript: Union[ArithExpr, Lit, None] = None
+    subscript_raw: str | None = None
 
 
 class CmdSubStyle(enum.Enum):
@@ -112,15 +135,99 @@ class CmdSub:
 
 
 @dataclass(eq=False)
-class Arith:
-    # Variable references surface as ShId/Param; everything else stays Lit.
-    parts: list[ArithPart]
+class ProcSub:
+    direction: str  # '<' for <(cmd), '>' for >(cmd)
+    raw: str
+    loc: Loc
+    # Filled by the parser via recursive parse of `raw`.
+    program: Program | None = None
+
+
+@dataclass(eq=False)
+class ArithNum:
+    text: str
     loc: Loc
 
 
+@dataclass(eq=False)
+class ArithVar:
+    id: ShId
+    subscript: ArithExpr | None
+    loc: Loc
+
+
+@dataclass(eq=False)
+class ArithUnary:
+    op: str
+    operand: ArithExpr
+    loc: Loc
+    postfix: bool = False
+
+
+@dataclass(eq=False)
+class ArithBinary:
+    op: str
+    left: ArithExpr
+    right: ArithExpr
+    loc: Loc
+
+
+@dataclass(eq=False)
+class ArithAssign:
+    target: ArithVar
+    op: str
+    value: ArithExpr
+    loc: Loc
+
+
+@dataclass(eq=False)
+class ArithTernary:
+    cond: ArithExpr
+    then: ArithExpr
+    otherwise: ArithExpr
+    loc: Loc
+
+
+@dataclass(eq=False)
+class ArithGroup:
+    inner: ArithExpr
+    loc: Loc
+
+
+@dataclass(eq=False)
+class ArithPart:
+    part: Union[Param, CmdSub, Arith]
+    loc: Loc
+
+
+@dataclass(eq=False)
+class Arith:
+    expr: ArithExpr
+    loc: Loc
+    deprecated: bool = False  # bash $[...]
+
+
+@dataclass(eq=False)
+class BraceExpand:
+    alternates: list[list[WordPart]] | None  # {a,b,...}; exactly one payload set
+    range: tuple[str, str, str | None] | None  # {start..end} / {start..end..step}
+    loc: Loc
+
+
+ArithExpr = Union[
+    ArithNum,
+    ArithVar,
+    ArithUnary,
+    ArithBinary,
+    ArithAssign,
+    ArithTernary,
+    ArithGroup,
+    ArithPart,
+]
 DQuotePart = Union[Lit, Escape, Param, CmdSub, Arith]
-WordPart = Union[Lit, Escape, SQuote, DQuote, Param, CmdSub, Arith]
-ArithPart = Union[Lit, Param, CmdSub, ShId]
+WordPart = Union[
+    Lit, Escape, SQuote, DQuote, AnsiCQuote, Param, CmdSub, Arith, BraceExpand, ProcSub
+]
 
 
 @dataclass(eq=False)
@@ -186,6 +293,19 @@ class Redirect:
     op_id: ShId
     target: Union[Word, HereDoc]
     loc: Loc
+    here_string: bool = False  # bash <<<
+    move: bool = False  # bash >&n- / <&n-
+    fd_var: ShId | None = None  # bash {var}> forms
+
+
+@dataclass(eq=False)
+class ArrayItem:
+    # bash `[i]=w` element of a compound assignment; subscript_raw is kept
+    # because associative-array subscripts are strings, not arithmetic
+    subscript: ArithExpr | None
+    subscript_raw: str | None
+    word: Word
+    loc: Loc
 
 
 @dataclass(eq=False)
@@ -193,6 +313,10 @@ class Assign:
     name_id: ShId
     word: Word
     loc: Loc
+    subscript: ArithExpr | None = None  # bash a[expr]=v
+    subscript_raw: str | None = None  # raw text; assoc keys are not arithmetic
+    array_items: list[ArrayItem] | None = None  # bash a=(w1 [i]=w2 ...)
+    append: bool = False  # bash += for scalars and arrays
 
 
 @dataclass(eq=False)
@@ -212,6 +336,8 @@ class Pipeline:
     cmds: list[Command]
     pipe_ids: list[ShId]
     loc: Loc
+    time_id: ShId | None = None  # bash `time` pipeline prefix
+    time_p: bool = False  # bash `time -p`
 
 
 @dataclass(eq=False)
@@ -283,11 +409,108 @@ class For:
 
 
 @dataclass(eq=False)
+class Select:
+    var_id: ShId
+    in_words: list[Word] | None  # None => implicit "$@"
+    body: list[Command]
+    redirects: list[Redirect]
+    keywords: list[ShId]
+    loc: Loc
+
+
+@dataclass(eq=False)
+class ForArith:
+    init: ArithExpr | None
+    cond: ArithExpr | None
+    step: ArithExpr | None
+    body: list[Command]
+    redirects: list[Redirect]
+    keywords: list[ShId]
+    loc: Loc
+
+
+@dataclass(eq=False)
+class ArithCommand:
+    expr: ArithExpr
+    redirects: list[Redirect]
+    keywords: list[ShId]  # '((' and '))'
+    loc: Loc
+
+
+@dataclass(eq=False)
+class Coproc:
+    name_id: ShId | None  # bash names the coprocess variable; COPROC when None
+    cmd: Command
+    keywords: list[ShId]  # 'coproc'
+    loc: Loc
+
+
+@dataclass(eq=False)
+class CondUnary:
+    op_id: ShId  # e.g. '-f', '-z'
+    operand: Word
+    loc: Loc
+
+
+@dataclass(eq=False)
+class CondBinary:
+    op_id: ShId  # '==', '=', '!=', '=~', '<', '>', '-eq', ...
+    left: Word
+    right: Word
+    loc: Loc
+
+
+@dataclass(eq=False)
+class CondNot:
+    bang_id: ShId
+    operand: CondExpr
+    loc: Loc
+
+
+@dataclass(eq=False)
+class CondAnd:
+    left: CondExpr
+    right: CondExpr
+    op_id: ShId
+    loc: Loc
+
+
+@dataclass(eq=False)
+class CondOr:
+    left: CondExpr
+    right: CondExpr
+    op_id: ShId
+    loc: Loc
+
+
+@dataclass(eq=False)
+class CondGroup:
+    inner: CondExpr
+    lparen_id: ShId
+    rparen_id: ShId
+    loc: Loc
+
+
+# A bare Word leaf tests non-emptiness of its expansion.
+CondExpr = Union[Word, CondUnary, CondBinary, CondNot, CondAnd, CondOr, CondGroup]
+
+
+@dataclass(eq=False)
+class CondCmd:
+    expr: CondExpr
+    redirects: list[Redirect]
+    keywords: list[ShId]  # '[[' and ']]'
+    loc: Loc
+
+
+@dataclass(eq=False)
 class CaseItem:
     patterns: list[Word]
     body: list[Command]
     keywords: list[ShId]
     loc: Loc
+    # ';;', bash ';&' / ';;&', or '' for a last item with no terminator
+    terminator: str = ";;"
 
 
 @dataclass(eq=False)
@@ -319,8 +542,13 @@ Command = Union[
     While,
     Until,
     For,
+    Select,
+    ForArith,
+    ArithCommand,
     Case,
     FunDef,
+    Coproc,
+    CondCmd,
 ]
 
 
@@ -354,6 +582,33 @@ RESERVED_WORDS = frozenset(
     ]
 )
 
+# Recognized positionally only in the BASH dialect.
+BASH_RESERVED_WORDS = frozenset(["function", "select", "time", "coproc", "[["])
+
+COND_UNARY_OPS = frozenset(
+    "-a -b -c -d -e -f -g -h -k -p -r -s -t -u -w -x "
+    "-G -L -N -O -S -o -v -R -z -n".split()
+)
+
+# '<' and '>' are also binary cond operators but arrive as operator tokens.
+COND_BINARY_OPS = frozenset(
+    [
+        "==",
+        "=",
+        "!=",
+        "=~",
+        "-eq",
+        "-ne",
+        "-lt",
+        "-le",
+        "-gt",
+        "-ge",
+        "-nt",
+        "-ot",
+        "-ef",
+    ]
+)
+
 _NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
 SPECIAL_PARAMS = frozenset(["@", "*", "#", "?", "-", "$", "!", "0"])
@@ -361,6 +616,19 @@ SPECIAL_PARAMS = frozenset(["@", "*", "#", "?", "-", "$", "!", "0"])
 
 def is_valid_name(s: str) -> bool:
     return _NAME_RE.match(s) is not None
+
+
+def matching_bracket(text: str, start: int) -> int | None:
+    """Index of the `]` matching the `[` at `start`, tracking nesting."""
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "[":
+            depth += 1
+        elif text[i] == "]":
+            depth -= 1
+            if depth == 0:
+                return i
+    return None
 
 
 def word_single_unquoted_lit(word: Word) -> str | None:

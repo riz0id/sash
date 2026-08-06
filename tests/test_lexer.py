@@ -6,6 +6,9 @@ import pytest
 
 from sash import (
     Arith,
+    ArithBinary,
+    ArithNum,
+    ArithVar,
     CmdSub,
     CmdSubStyle,
     DQuote,
@@ -162,9 +165,12 @@ def test_param_length() -> None:
 def test_arith_bare_name_is_ref() -> None:
     part = first_word("$((x + 1))").parts[0]
     assert isinstance(part, Arith)
-    refs = [p for p in part.parts if isinstance(p, ShId)]
-    assert [r.sym for r in refs] == ["x"]
-    assert refs[0].kind is IdKind.VARIABLE_REF
+    expr = part.expr
+    assert isinstance(expr, ArithBinary) and expr.op == "+"
+    assert isinstance(expr.left, ArithVar)
+    assert expr.left.id.sym == "x"
+    assert expr.left.id.kind is IdKind.VARIABLE_REF
+    assert isinstance(expr.right, ArithNum) and expr.right.text == "1"
 
 
 def test_dollar_paren_paren_that_is_not_arith() -> None:

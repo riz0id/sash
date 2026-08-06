@@ -1,20 +1,24 @@
-"""CLI: parse a POSIX sh script, bind it, and report every identifier."""
+"""CLI: parse a shell script, bind it, and report every identifier."""
 
 from __future__ import annotations
 
 import sys
 
 from . import namespace_for, resolve_identifier, sh_read_program
-from .nodes import ShParseError
+from .nodes import Dialect, ShParseError
 from .render import iter_ids, pretty
 from .scopes import ShAmbiguityError
 
 
-def main() -> None:
-    args = sys.argv[1:]
+def main(argv: list[str] | None = None) -> None:
+    args = list(sys.argv[1:] if argv is None else argv)
     if args and args[0] in ("-h", "--help"):
-        print("usage: sash [file]", file=sys.stderr)
+        print("usage: sash [--bash] [file]", file=sys.stderr)
         raise SystemExit(0)
+    dialect = Dialect.POSIX
+    if "--bash" in args:
+        args.remove("--bash")
+        dialect = Dialect.BASH
     if args:
         src = args[0]
         with open(src, encoding="utf-8") as handle:
@@ -24,7 +28,7 @@ def main() -> None:
         text = sys.stdin.read()
 
     try:
-        program, _store = sh_read_program(text, src)
+        program, _store = sh_read_program(text, src, dialect=dialect)
     except ShParseError as err:
         print(f"sash: {err}", file=sys.stderr)
         raise SystemExit(1) from None
