@@ -1,10 +1,12 @@
-"""Claude Code PreToolUse hook: auto-allow Bash commands proven safe by sash.
+"""Claude Code PreToolUse hook: decide Bash permissions with sash.
 
 Parses the proposed command with sash and emits an "allow" decision when
-every pipeline stage is a literal-only simple command whose text matches an
-existing Bash(...) allow rule in Claude settings. Anything else — parse
-errors, expansions, redirects, compound commands, deny-rule matches — stays
-silent so the normal permission flow runs.
+every subcommand of the chain is a literal-only simple command whose text
+matches a Bash(...) allow rule in Claude settings. If any subcommand matches
+a deny rule, emits an explicit "deny" decision naming that rule — a denied
+stage anywhere in a &&/||/| chain denies the whole command. Anything else —
+parse errors, expansions, redirects, unlisted commands — stays silent so the
+normal permission flow runs.
 """
 
 from __future__ import annotations
@@ -88,30 +90,37 @@ def rule_matches(rule: str, text: str) -> bool:
     return any(t == rule for t in texts)
 
 
-def check(cmd: Command, source: str, allow: list[str], deny: list[str]) -> bool:
-    """True iff every stage is a literal-only allowlisted simple command.
-
-    Raises PermissionError when a stage matches a deny rule, aborting the
-    whole decision rather than merely failing this branch.
-    """
+def collect_stages(cmd: Command) -> list[Simple] | None:
+    """Flatten a command into its simple-command stages, None if unsupported."""
     if isinstance(cmd, Simple):
-        if cmd.assigns or cmd.redirects or not cmd.words:
-            return False
-        if not all(word_is_literal(w) for w in cmd.words):
-            return False
-        text = stage_text(cmd, source)
-        if any(rule_matches(r, text) for r in deny):
-            raise PermissionError
-        return any(rule_matches(r, text) for r in allow)
+        return [cmd]
     if isinstance(cmd, Pipeline):
         if cmd.bang_id is not None or cmd.time_id is not None:
-            return False
-        return all(check(c, source, allow, deny) for c in cmd.cmds)
+            return None
+        stages: list[Simple] = []
+        for c in cmd.cmds:
+            got = collect_stages(c)
+            if got is None:
+                return None
+            stages.extend(got)
+        return stages
     if isinstance(cmd, AndOr):
-        return check(cmd.left, source, allow, deny) and check(
-            cmd.right, source, allow, deny
-        )
-    return False
+        left = collect_stages(cmd.left)
+        right = collect_stages(cmd.right)
+        if left is None or right is None:
+            return None
+        return left + right
+    return None
+
+
+def decision(kind: str, reason: str) -> dict[str, Any]:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": kind,
+            "permissionDecisionReason": reason,
+        }
+    }
 
 
 def decide(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -121,38 +130,52 @@ def decide(payload: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(command, str) or not command.strip():
         return None
     allow, deny = load_rules(os.environ.get("CLAUDE_PROJECT_DIR") or payload.get("cwd"))
-    if not allow:
+    if not allow and not deny:
         return None
     try:
         program: Program = sh_read(command, dialect=Dialect.BASH)
     except ShParseError:
         return None
-    try:
-        if not program.commands or not all(
-            check(c, command, allow, deny) for c in program.commands
-        ):
+    stages: list[Simple] = []
+    for cmd in program.commands:
+        got = collect_stages(cmd)
+        if got is None:
             return None
-    except PermissionError:
+        stages.extend(got)
+    if not stages:
         return None
-    return {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "allow",
-            "permissionDecisionReason": (
-                "sash: all commands allowlisted; no unquoted "
-                "operators/expansions/redirects"
-            ),
-        }
-    }
+    for stage in stages:
+        if not stage.words or not all(word_is_literal(w) for w in stage.words):
+            continue
+        text = stage_text(stage, command)
+        for rule in deny:
+            if rule_matches(rule, text):
+                return decision(
+                    "deny",
+                    f"sash: subcommand '{text}' matches deny rule Bash({rule}); "
+                    "every command in a chain must be permitted",
+                )
+    for stage in stages:
+        if stage.assigns or stage.redirects or not stage.words:
+            return None
+        if not all(word_is_literal(w) for w in stage.words):
+            return None
+        text = stage_text(stage, command)
+        if not any(rule_matches(r, text) for r in allow):
+            return None
+    return decision(
+        "allow",
+        "sash: all commands allowlisted; no unquoted " "operators/expansions/redirects",
+    )
 
 
 def main() -> None:
     try:
-        decision = decide(json.load(sys.stdin))
+        result = decide(json.load(sys.stdin))
     except Exception:
-        decision = None
-    if decision is not None:
-        print(json.dumps(decision))
+        result = None
+    if result is not None:
+        print(json.dumps(result))
 
 
 if __name__ == "__main__":
