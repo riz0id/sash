@@ -7,7 +7,9 @@ a deny rule, emits an explicit "deny" decision whose reason aggregates the
 advice from every matching deny rule across the chain — a denied stage
 anywhere in a &&/||/| chain denies the whole command. Anything else —
 parse errors, expansions, redirects, unlisted commands — stays silent so the
-normal permission flow runs.
+normal permission flow runs. The sole redirect exception is `2>&1`: merging
+stderr into stdout touches no files, so it cannot widen what an allow rule
+already permits.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ from sash import (
     Lit,
     Pipeline,
     Program,
+    Redirect,
     ShParseError,
     Simple,
     SQuote,
@@ -60,6 +63,20 @@ def load_rules(project_dir: str | None) -> tuple[list[str], list[str]]:
                 ):
                     out.append(rule[len("Bash(") : -1])
     return allow, deny
+
+
+def redirect_is_stderr_merge(redirect: Redirect) -> bool:
+    """True iff the redirect is exactly `2>&1`."""
+    return (
+        redirect.n == 2
+        and redirect.op_id.sym == ">&"
+        and not redirect.move
+        and redirect.fd_var is None
+        and isinstance(redirect.target, Word)
+        and len(redirect.target.parts) == 1
+        and isinstance(redirect.target.parts[0], Lit)
+        and redirect.target.parts[0].text == "1"
+    )
 
 
 def word_is_literal(word: Word) -> bool:
@@ -163,7 +180,9 @@ def decide(payload: dict[str, Any]) -> dict[str, Any] | None:
             + "; every command in a chain must be permitted",
         )
     for stage in stages:
-        if stage.assigns or stage.redirects or not stage.words:
+        if stage.assigns or not stage.words:
+            return None
+        if not all(redirect_is_stderr_merge(r) for r in stage.redirects):
             return None
         if not all(word_is_literal(w) for w in stage.words):
             return None
@@ -172,7 +191,8 @@ def decide(payload: dict[str, Any]) -> dict[str, Any] | None:
             return None
     return decision(
         "allow",
-        "sash: all commands allowlisted; no unquoted " "operators/expansions/redirects",
+        "sash: all commands allowlisted; no unquoted "
+        "operators/expansions/redirects beyond 2>&1",
     )
 
 
