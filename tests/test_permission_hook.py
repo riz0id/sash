@@ -132,6 +132,24 @@ def test_deny_wins_over_unlisted_stage_in_chain(decide: Decide) -> None:
     assert_denied(decide("whoami && grep foo"), "grep *")
 
 
+def test_deny_aggregates_advice_from_all_matching_rules(decide: Decide) -> None:
+    result = decide("ls -R / | whoami | grep foo")
+    assert result is not None
+    assert_denied(result, "ls -R /")
+    assert_denied(result, "grep *")
+    reason = result["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "subcommand 'ls -R /' matches deny rule Bash(ls -R /)" in reason
+    assert "subcommand 'grep foo' matches deny rule Bash(grep *)" in reason
+
+
+def test_deny_advice_deduplicates_repeated_stage(decide: Decide) -> None:
+    result = decide("grep foo && grep foo")
+    assert result is not None
+    assert_denied(result, "grep *")
+    reason = result["hookSpecificOutput"]["permissionDecisionReason"]
+    assert reason.count("matches deny rule") == 1
+
+
 # --- fall-through: non-literals and unprovable commands ---
 
 

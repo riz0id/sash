@@ -3,8 +3,9 @@
 Parses the proposed command with sash and emits an "allow" decision when
 every subcommand of the chain is a literal-only simple command whose text
 matches a Bash(...) allow rule in Claude settings. If any subcommand matches
-a deny rule, emits an explicit "deny" decision naming that rule — a denied
-stage anywhere in a &&/||/| chain denies the whole command. Anything else —
+a deny rule, emits an explicit "deny" decision whose reason aggregates the
+advice from every matching deny rule across the chain — a denied stage
+anywhere in a &&/||/| chain denies the whole command. Anything else —
 parse errors, expansions, redirects, unlisted commands — stays silent so the
 normal permission flow runs.
 """
@@ -144,17 +145,23 @@ def decide(payload: dict[str, Any]) -> dict[str, Any] | None:
         stages.extend(got)
     if not stages:
         return None
+    denials: list[str] = []
     for stage in stages:
         if not stage.words or not all(word_is_literal(w) for w in stage.words):
             continue
         text = stage_text(stage, command)
         for rule in deny:
             if rule_matches(rule, text):
-                return decision(
-                    "deny",
-                    f"sash: subcommand '{text}' matches deny rule Bash({rule}); "
-                    "every command in a chain must be permitted",
-                )
+                advice = f"subcommand '{text}' matches deny rule Bash({rule})"
+                if advice not in denials:
+                    denials.append(advice)
+    if denials:
+        return decision(
+            "deny",
+            "sash: "
+            + "; ".join(denials)
+            + "; every command in a chain must be permitted",
+        )
     for stage in stages:
         if stage.assigns or stage.redirects or not stage.words:
             return None
