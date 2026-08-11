@@ -15,8 +15,13 @@ assert _spec is not None and _spec.loader is not None
 hook = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(hook)
 
-ALLOW = ["Bash(rg)", "Bash(git status)", "Bash(ls:*)", "Bash(cat *)"]
-DENY = ["Bash(grep *)", "Bash(ls -R /)"]
+ALLOW = ["Bash(rg)", "Bash(git status)", "Bash(ls:*)", "Bash(cat *)", "Bash(du -[sh]*)"]
+DENY = ["Bash(grep *)", "Bash(ls -R /)", "Bash(sed -n [0-9]*,[0-9]*p*)"]
+DENY_ADVICE = {
+    "Bash(sed -n [0-9]*,[0-9]*p*)": (
+        "Use the Read tool with offset = M and limit = N - M + 1 instead."
+    )
+}
 
 
 class Decide(Protocol):
@@ -33,7 +38,15 @@ def decide(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Decide:
     project = tmp_path / "project"
     (project / ".claude").mkdir(parents=True)
     (project / ".claude" / "settings.json").write_text(
-        json.dumps({"permissions": {"allow": ALLOW, "deny": DENY}}),
+        json.dumps(
+            {
+                "permissions": {
+                    "allow": ALLOW,
+                    "deny": DENY,
+                    "denyAdvice": DENY_ADVICE,
+                }
+            }
+        ),
         encoding="utf-8",
     )
     monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(project))
@@ -148,6 +161,53 @@ def test_deny_advice_deduplicates_repeated_stage(decide: Decide) -> None:
     assert_denied(result, "grep *")
     reason = result["hookSpecificOutput"]["permissionDecisionReason"]
     assert reason.count("matches deny rule") == 1
+
+
+# --- glob rules: fnmatch beyond the native rule forms ---
+
+
+GLOB_RULE = "sed -n [0-9]*,[0-9]*p*"
+
+
+def test_glob_deny_matches_unquoted_range(decide: Decide) -> None:
+    assert_denied(decide("sed -n 1,20p file.txt"), GLOB_RULE)
+
+
+def test_glob_deny_matches_single_quoted_range_via_argv(decide: Decide) -> None:
+    assert_denied(decide("sed -n '1,20p' file.txt"), GLOB_RULE)
+
+
+def test_glob_deny_matches_double_quoted_range_via_argv(decide: Decide) -> None:
+    assert_denied(decide('sed -n "1,20p" file.txt'), GLOB_RULE)
+
+
+def test_glob_deny_blocks_pipeline_stage(decide: Decide) -> None:
+    assert_denied(decide("rg | sed -n '1,5p'"), GLOB_RULE)
+
+
+def test_glob_deny_appends_advice(decide: Decide) -> None:
+    result = decide("sed -n 1,20p file.txt")
+    assert result is not None
+    reason = result["hookSpecificOutput"]["permissionDecisionReason"]
+    assert DENY_ADVICE[f"Bash({GLOB_RULE})"] in reason
+
+
+def test_glob_deny_ignores_pattern_in_argument_of_other_command(
+    decide: Decide,
+) -> None:
+    assert decide("echo \"sed -n '1,5p'\"") is None
+
+
+def test_glob_deny_ignores_non_range_sed(decide: Decide) -> None:
+    assert decide("sed -n 5p file.txt") is None
+
+
+def test_glob_allow_rule(decide: Decide) -> None:
+    assert_allowed(decide("du -sh /nix"))
+
+
+def test_glob_allow_rule_non_matching_falls_through(decide: Decide) -> None:
+    assert decide("du /nix") is None
 
 
 # --- fall-through: non-literals and unprovable commands ---

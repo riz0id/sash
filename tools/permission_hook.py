@@ -10,10 +10,20 @@ parse errors, expansions, redirects, unlisted commands — stays silent so the
 normal permission flow runs. The sole redirect exception is `2>&1`: merging
 stderr into stdout touches no files, so it cannot widen what an allow rule
 already permits.
+
+Beyond Claude Code's native rule forms (exact, `prefix:*`, `prefix *`),
+rules containing other glob metacharacters are matched with fnmatch, e.g.
+`Bash(sed -n [0-9]*,[0-9]*p*)`. Glob rules are additionally matched against
+the stage's dequoted argv text, so quoting cannot dodge them, while the
+pattern occurring inside another command's argument does not match.
+
+The optional `permissions.denyAdvice` settings map keys the full Bash(...)
+deny rule to remediation advice appended to that rule's denial reason.
 """
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import sys
@@ -42,13 +52,14 @@ from sash import (
 LITERAL_PARTS = (Lit, Escape, SQuote)
 
 
-def load_rules(project_dir: str | None) -> tuple[list[str], list[str]]:
+def load_rules(project_dir: str | None) -> tuple[list[str], list[str], dict[str, str]]:
     paths = [Path.home() / ".claude" / "settings.json"]
     if project_dir:
         paths.append(Path(project_dir) / ".claude" / "settings.json")
         paths.append(Path(project_dir) / ".claude" / "settings.local.json")
     allow: list[str] = []
     deny: list[str] = []
+    advice: dict[str, str] = {}
     for path in paths:
         try:
             perms = json.loads(path.read_text()).get("permissions", {})
@@ -62,7 +73,17 @@ def load_rules(project_dir: str | None) -> tuple[list[str], list[str]]:
                     and rule.endswith(")")
                 ):
                     out.append(rule[len("Bash(") : -1])
-    return allow, deny
+        deny_advice = perms.get("denyAdvice", {})
+        if isinstance(deny_advice, dict):
+            for rule, text in deny_advice.items():
+                if (
+                    isinstance(rule, str)
+                    and isinstance(text, str)
+                    and rule.startswith("Bash(")
+                    and rule.endswith(")")
+                ):
+                    advice[rule[len("Bash(") : -1]] = text
+    return allow, deny, advice
 
 
 def redirect_is_stderr_merge(redirect: Redirect) -> bool:
@@ -95,7 +116,24 @@ def stage_text(simple: Simple, source: str) -> str:
     return source[first.pos : last.pos + last.span]
 
 
-def rule_matches(rule: str, text: str) -> bool:
+def word_text(word: Word) -> str:
+    """Dequoted text of a literal-only word: the argv string it executes as."""
+    out: list[str] = []
+    for part in word.parts:
+        if isinstance(part, (Lit, SQuote)):
+            out.append(part.text)
+        elif isinstance(part, Escape):
+            out.append(part.ch)
+        elif isinstance(part, DQuote):
+            out.extend(p.text if isinstance(p, Lit) else p.ch for p in part.parts)
+    return "".join(out)
+
+
+def stage_argv_text(simple: Simple) -> str:
+    return " ".join(word_text(w) for w in simple.words)
+
+
+def rule_matches(rule: str, text: str, argv_text: str) -> bool:
     texts = (text, " ".join(text.split()))
     if rule.endswith(":*"):
         prefix = rule[:-2]
@@ -103,8 +141,8 @@ def rule_matches(rule: str, text: str) -> bool:
     if rule.endswith(" *"):
         prefix = rule[:-2]
         return any(t.startswith(prefix + " ") for t in texts)
-    if "*" in rule:
-        return False
+    if any(ch in rule for ch in "*?["):
+        return any(fnmatch.fnmatchcase(t, rule) for t in (*texts, argv_text))
     return any(t == rule for t in texts)
 
 
@@ -147,7 +185,9 @@ def decide(payload: dict[str, Any]) -> dict[str, Any] | None:
     command = payload.get("tool_input", {}).get("command")
     if not isinstance(command, str) or not command.strip():
         return None
-    allow, deny = load_rules(os.environ.get("CLAUDE_PROJECT_DIR") or payload.get("cwd"))
+    allow, deny, deny_advice = load_rules(
+        os.environ.get("CLAUDE_PROJECT_DIR") or payload.get("cwd")
+    )
     if not allow and not deny:
         return None
     try:
@@ -167,9 +207,13 @@ def decide(payload: dict[str, Any]) -> dict[str, Any] | None:
         if not stage.words or not all(word_is_literal(w) for w in stage.words):
             continue
         text = stage_text(stage, command)
+        argv_text = stage_argv_text(stage)
         for rule in deny:
-            if rule_matches(rule, text):
+            if rule_matches(rule, text, argv_text):
                 advice = f"subcommand '{text}' matches deny rule Bash({rule})"
+                extra = deny_advice.get(rule)
+                if extra:
+                    advice += f": {extra}"
                 if advice not in denials:
                     denials.append(advice)
     if denials:
@@ -187,7 +231,8 @@ def decide(payload: dict[str, Any]) -> dict[str, Any] | None:
         if not all(word_is_literal(w) for w in stage.words):
             return None
         text = stage_text(stage, command)
-        if not any(rule_matches(r, text) for r in allow):
+        argv_text = stage_argv_text(stage)
+        if not any(rule_matches(r, text, argv_text) for r in allow):
             return None
     return decision(
         "allow",
